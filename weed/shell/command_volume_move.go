@@ -4,11 +4,12 @@ import (
 	"context"
 	"flag"
 	"fmt"
-	"github.com/seaweedfs/seaweedfs/weed/pb"
-	"github.com/seaweedfs/seaweedfs/weed/wdclient"
 	"io"
 	"log"
 	"time"
+
+	"github.com/seaweedfs/seaweedfs/weed/pb"
+	"github.com/seaweedfs/seaweedfs/weed/wdclient"
 
 	"github.com/seaweedfs/seaweedfs/weed/operation"
 	"github.com/seaweedfs/seaweedfs/weed/pb/volume_server_pb"
@@ -79,11 +80,49 @@ func (c *commandVolumeMove) Do(args []string, commandEnv *CommandEnv, writer io.
 func LiveMoveVolume(grpcDialOption grpc.DialOption, writer io.Writer, volumeId needle.VolumeId, sourceVolumeServer, targetVolumeServer pb.ServerAddress, idleTimeout time.Duration, diskType string, ioBytePerSecond int64, skipTailError bool) (err error) {
 
 	log.Printf("copying volume %d from %s to %s", volumeId, sourceVolumeServer, targetVolumeServer)
+	var shouldMarkWritable bool
+	defer func() {
+		// 5. mark as writable if shouldMarkWritable is true
+		if !shouldMarkWritable {
+			return
+		}
+
+		clientErr := operation.WithVolumeServerClient(false, sourceVolumeServer, grpcDialOption, func(volumeServerClient volume_server_pb.VolumeServerClient) error {
+			_, writableErr := volumeServerClient.VolumeMarkWritable(context.Background(), &volume_server_pb.VolumeMarkWritableRequest{
+				VolumeId: uint32(volumeId),
+			})
+			return writableErr
+		})
+		if clientErr != nil {
+			log.Printf("failed to mark volume %d as writable after copy from %s: %v", volumeId, sourceVolumeServer, clientErr)
+		}
+	}()
+
+	// 1. mark as readonly (if previously status not readonly)
+	err = operation.WithVolumeServerClient(false, sourceVolumeServer, grpcDialOption, func(volumeServerClient volume_server_pb.VolumeServerClient) error {
+		resp, statusErr := volumeServerClient.VolumeStatus(context.Background(), &volume_server_pb.VolumeStatusRequest{
+			VolumeId: uint32(volumeId),
+		})
+		if statusErr == nil && !resp.IsReadOnly {
+			shouldMarkWritable = true
+			_, readonlyErr := volumeServerClient.VolumeMarkReadonly(context.Background(), &volume_server_pb.VolumeMarkReadonlyRequest{
+				VolumeId: uint32(volumeId),
+			})
+			return readonlyErr
+		}
+		return statusErr
+	})
+	if err != nil {
+		return fmt.Errorf("copy volume %d from %s to %s: %v", volumeId, sourceVolumeServer, targetVolumeServer, err)
+	}
+
+	// 2. copy volume
 	lastAppendAtNs, err := copyVolume(grpcDialOption, writer, volumeId, sourceVolumeServer, targetVolumeServer, diskType, ioBytePerSecond)
 	if err != nil {
 		return fmt.Errorf("copy volume %d from %s to %s: %v", volumeId, sourceVolumeServer, targetVolumeServer, err)
 	}
 
+	// 3. tail volume
 	log.Printf("tailing volume %d from %s to %s", volumeId, sourceVolumeServer, targetVolumeServer)
 	if err = tailVolume(grpcDialOption, volumeId, sourceVolumeServer, targetVolumeServer, lastAppendAtNs, idleTimeout); err != nil {
 		if skipTailError {
@@ -93,6 +132,7 @@ func LiveMoveVolume(grpcDialOption grpc.DialOption, writer io.Writer, volumeId n
 		}
 	}
 
+	// 4. delete source volume
 	log.Printf("deleting volume %d from %s", volumeId, sourceVolumeServer)
 	if err = deleteVolume(grpcDialOption, volumeId, sourceVolumeServer); err != nil {
 		return fmt.Errorf("delete volume %d from %s: %v", volumeId, sourceVolumeServer, err)
@@ -102,7 +142,7 @@ func LiveMoveVolume(grpcDialOption grpc.DialOption, writer io.Writer, volumeId n
 	return nil
 }
 
-func copyVolume(grpcDialOption grpc.DialOption, writer io.Writer, volumeId needle.VolumeId, sourceVolumeServer, targetVolumeServer pb.ServerAddress, diskType string, ioBytePerSecond int64) (lastAppendAtNs uint64, err error) {
+func safeCopyVolume(grpcDialOption grpc.DialOption, writer io.Writer, volumeId needle.VolumeId, sourceVolumeServer, targetVolumeServer pb.ServerAddress, diskType string, ioBytePerSecond int64) (lastAppendAtNs uint64, err error) {
 
 	// check to see if the volume is already read-only and if its not then we need
 	// to mark it as read-only and then before we return we need to undo what we
@@ -140,7 +180,12 @@ func copyVolume(grpcDialOption grpc.DialOption, writer io.Writer, volumeId needl
 	if err != nil {
 		return
 	}
+	// copy volume
+	lastAppendAtNs, err = copyVolume(grpcDialOption, writer, volumeId, sourceVolumeServer, targetVolumeServer, diskType, ioBytePerSecond)
+	return
+}
 
+func copyVolume(grpcDialOption grpc.DialOption, writer io.Writer, volumeId needle.VolumeId, sourceVolumeServer, targetVolumeServer pb.ServerAddress, diskType string, ioBytePerSecond int64) (lastAppendAtNs uint64, err error) {
 	err = operation.WithVolumeServerClient(true, targetVolumeServer, grpcDialOption, func(volumeServerClient volume_server_pb.VolumeServerClient) error {
 		stream, replicateErr := volumeServerClient.VolumeCopy(context.Background(), &volume_server_pb.VolumeCopyRequest{
 			VolumeId:        uint32(volumeId),
